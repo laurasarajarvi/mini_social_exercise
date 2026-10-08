@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+from flask import Flask, render_template, request, redirect, url_for, session, flash, g, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
@@ -78,6 +78,28 @@ def query_db(query, args=(), one=False, commit=False):
         print(f"Database error: {e}")
         return None
 
+def get_user_activity(user_id):
+    """Calculates user post count, community average, and sets a challenge target."""
+    if not user_id:
+        return None
+
+    user_posts_row = query_db('SELECT COUNT(*) as count FROM posts WHERE user_id = ?', (user_id,), one=True)
+    user_posts = user_posts_row['count'] if user_posts_row else 0
+
+    avg_posts_row = query_db('''
+        SELECT CAST(COUNT(posts.id) AS FLOAT) / MAX(1, (SELECT COUNT(*) FROM users)) as avg_count
+        FROM posts
+    ''', one=True)
+    avg_posts = round(avg_posts_row['avg_count'] if avg_posts_row else 0.0, 1)
+
+    suggested_target = max(user_posts + 5, int(avg_posts) + 5)
+
+    return {
+        'user_posts': user_posts,
+        'avg_posts': avg_posts,
+        'suggested_target': suggested_target
+    }
+
 @app.template_filter('datetimeformat')
 def datetimeformat(value):
     if isinstance(value, datetime):
@@ -94,9 +116,49 @@ REACTION_EMOJIS = {
 }
 REACTION_TYPES = list(REACTION_EMOJIS.keys())
 
+def init_groups():
+    """Ensure groups and group_members tables exist, add group_id to posts, and seed default groups."""
+    query_db('''
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT NOT NULL
+        )
+    ''')
+    query_db('''
+        CREATE TABLE IF NOT EXISTS group_members (
+            group_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            PRIMARY KEY (group_id, user_id),
+            FOREIGN KEY (group_id) REFERENCES groups (id),
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Safely ensure posts table has group_id column
+    try:
+        query_db('ALTER TABLE posts ADD COLUMN group_id INTEGER REFERENCES groups(id)')
+    except Exception:
+        pass  # Column already exists
+
+    # Seed initial named subgroups if table is empty
+    existing_groups = query_db('SELECT COUNT(*) as count FROM groups', one=True)
+    if existing_groups and existing_groups['count'] == 0:
+        default_groups = [
+            ('💻 Tech & Code', 'A subgroup for developers, tech enthusiasts, and builders.'),
+            ('📚 Book Club', 'Discussing great reads, recommendations, and literary ideas.'),
+            ('🏃 Fitness & Health', 'Sharing workout routines, healthy habits, and wellness tips.'),
+            ('🎨 Creative Arts', 'A space for art, photography, design, and creative projects.')
+        ]   
+        for name, desc in default_groups:
+            query_db('INSERT INTO groups (name, description) VALUES (?, ?)', (name, desc))
+
 
 @app.route('/')
 def feed():
+    # Initialize subgroup database schema before executing feed queries
+    init_groups()
+
     #  1. Get Pagination and Filter Parameters 
     try:
         page = int(request.args.get('page', 1))
@@ -112,10 +174,13 @@ def feed():
     current_user_id = session.get('user_id')
     params = []
 
-    #  2. Build the Query 
+    #  2. Build the Query with Subgroup Filtering Support
     where_clause = ""
     if show == 'following' and current_user_id:
         where_clause = "WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        params.append(current_user_id)
+    elif show == 'my_groups' and current_user_id:
+        where_clause = "WHERE p.group_id IN (SELECT group_id FROM group_members WHERE user_id = ?)"
         params.append(current_user_id)
 
     # Add the pagination parameters to the query arguments
@@ -124,9 +189,11 @@ def feed():
     if sort == 'popular':
         query = f"""
             SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+                   g.id as group_id, g.name as group_name,
                    IFNULL(r.total_reactions, 0) as total_reactions
             FROM posts p
             JOIN users u ON p.user_id = u.id
+            LEFT JOIN groups g ON p.group_id = g.id
             LEFT JOIN (
                 SELECT post_id, COUNT(*) as total_reactions FROM reactions GROUP BY post_id
             ) r ON p.id = r.post_id
@@ -135,20 +202,22 @@ def feed():
             LIMIT ? OFFSET ?
         """
         final_params = params + list(pagination_params)
-        posts = query_db(query, final_params)
+        posts = query_db(query, final_params) or []
     elif sort == 'recommended':
-        posts = recommend(current_user_id, show == 'following' and current_user_id)
+        posts = recommend(current_user_id, show == 'following' and current_user_id) or []
     else:  # Default sort is 'new'
         query = f"""
-            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+                   g.id as group_id, g.name as group_name
             FROM posts p
             JOIN users u ON p.user_id = u.id
+            LEFT JOIN groups g ON p.group_id = g.id
             {where_clause}
             ORDER BY p.created_at DESC
             LIMIT ? OFFSET ?
         """
         final_params = params + list(pagination_params)
-        posts = query_db(query, final_params)
+        posts = query_db(query, final_params) or []
 
     posts_data = []
     for post in posts:
@@ -174,8 +243,8 @@ def feed():
             if reaction_check:
                 user_reaction = reaction_check['reaction_type']
 
-        reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],))
-        comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
+        reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],)) or []
+        comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],)) or []
         post_dict = dict(post)
         post_dict['content'], _ = moderate_content(post_dict['content'])
         comments_moderated = []
@@ -191,19 +260,57 @@ def feed():
             'comments': comments_moderated
         })
 
-    #  4. Render Template with Pagination Info 
+    activity = get_user_activity(current_user_id) if current_user_id else None
+
+    # Needed Contributions Widget
+    needed_contributions = []
+    if current_user_id:
+        needed_contributions = query_db('''
+            SELECT p.id, u.username
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            JOIN follows f ON p.user_id = f.followed_id
+            WHERE p.id NOT IN (SELECT post_id FROM comments)
+            AND f.follower_id = ?
+            ORDER BY p.created_at DESC
+            LIMIT 3
+        ''', (current_user_id,)) or []
+
+    # Named Subgroups Data
+    if current_user_id:
+        all_groups = query_db('''
+            SELECT g.id, g.name, g.description,
+                   COUNT(gm.user_id) as member_count,
+                   MAX(CASE WHEN gm.user_id = ? THEN 1 ELSE 0 END) as is_member
+            FROM groups g
+            LEFT JOIN group_members gm ON g.id = gm.group_id
+            GROUP BY g.id
+        ''', (current_user_id,)) or []
+    else:
+        all_groups = query_db('''
+            SELECT g.id, g.name, g.description,
+                   COUNT(gm.user_id) as member_count,
+                   0 as is_member
+            FROM groups g
+            LEFT JOIN group_members gm ON g.id = gm.group_id
+            GROUP BY g.id
+        ''') or []
+
     return render_template('feed.html.j2', 
                            posts=posts_data, 
                            current_sort=sort,
                            current_show=show,
-                           page=page, # Pass current page number
-                           per_page=POSTS_PER_PAGE, # Pass items per page
+                           page=page,
+                           per_page=POSTS_PER_PAGE,
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           activity=activity,
+                           needed_contributions=needed_contributions,
+                           all_groups=all_groups)
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
-    """Handles creating a new post from the feed."""
+    """Handles creating a new post from the feed or a subgroup."""
     user_id = session.get('user_id')
 
     # Block access if user is not logged in
@@ -213,6 +320,7 @@ def add_post():
 
     # Get content from the submitted form
     content = request.form.get('content')
+    group_id = request.form.get('group_id') or None
 
     # Pass the user's content through the moderation function
     moderated_content = content
@@ -220,18 +328,70 @@ def add_post():
     # Basic validation to ensure post is not empty
     if moderated_content and moderated_content.strip():
         db = get_db()
-        db.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)',
-                   (user_id, moderated_content))
+        db.execute('INSERT INTO posts (user_id, content, group_id) VALUES (?, ?, ?)',
+                   (user_id, moderated_content, group_id))
         db.commit()
         flash('Your post was successfully created!', 'success')
     else:
         # This will catch empty posts or posts that were fully censored
         flash('Post cannot be empty or was fully censored.', 'warning')
 
-    # Redirect back to the main feed to see the new post
-    return redirect(url_for('feed'))
-    
-    
+    return redirect(request.referrer or url_for('feed'))
+
+@app.route('/groups/<int:group_id>')
+def group_detail(group_id):
+    """Displays a single subgroup with its description, members, and group-specific posts."""
+    current_user_id = session.get('user_id')
+
+    group = query_db('''
+        SELECT g.id, g.name, g.description,
+               COUNT(gm.user_id) as member_count,
+               MAX(CASE WHEN gm.user_id = ? THEN 1 ELSE 0 END) as is_member
+        FROM groups g
+        LEFT JOIN group_members gm ON g.id = gm.group_id
+        WHERE g.id = ?
+        GROUP BY g.id
+    ''', (current_user_id, group_id), one=True)
+
+    if not group:
+        flash("Subgroup not found.", "danger")
+        return redirect(url_for('feed'))
+
+    posts = query_db('''
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+               g.id as group_id, g.name as group_name
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        LEFT JOIN groups g ON p.group_id = g.id
+        WHERE p.group_id = ?
+        ORDER BY p.created_at DESC
+    ''', (group_id,)) or []
+
+    posts_data = []
+    for post in posts:
+        reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],)) or []
+        comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],)) or []
+
+        post_dict = dict(post)
+        post_dict['content'], _ = moderate_content(post_dict['content'])
+        comments_moderated = []
+        for comment in comments_raw:
+            comment_dict = dict(comment)
+            comment_dict['content'], _ = moderate_content(comment_dict['content'])
+            comments_moderated.append(comment_dict)
+
+        posts_data.append({
+            'post': post_dict,
+            'reactions': reactions,
+            'comments': comments_moderated
+        })
+
+    return render_template('group_detail.html.j2',
+                           group=group,
+                           posts=posts_data,
+                           reaction_emojis=REACTION_EMOJIS,
+                           reaction_types=REACTION_TYPES)
+
 @app.route('/posts/<int:post_id>/delete', methods=['POST'])
 def delete_post(post_id):
     """Handles deleting a post."""
@@ -280,7 +440,7 @@ def user_profile(username):
     moderated_bio, _ = moderate_content(user.get('profile', ''))
     user['profile'] = moderated_bio
 
-    posts_raw = query_db('SELECT id, content, user_id, created_at FROM posts WHERE user_id = ? ORDER BY created_at DESC', (user['id'],))
+    posts_raw = query_db('SELECT id, content, user_id, created_at FROM posts WHERE user_id = ? ORDER BY created_at DESC', (user['id'],)) or []
     posts = []
     for post_raw in posts_raw:
         post = dict(post_raw)
@@ -288,7 +448,7 @@ def user_profile(username):
         post['content'] = moderated_post_content
         posts.append(post)
 
-    comments_raw = query_db('SELECT id, content, user_id, post_id, created_at FROM comments WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', (user['id'],))
+    comments_raw = query_db('SELECT id, content, user_id, post_id, created_at FROM comments WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', (user['id'],)) or []
     comments = []
     for comment_raw in comments_raw:
         comment = dict(comment_raw)
@@ -299,8 +459,7 @@ def user_profile(username):
     followers_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE followed_id = ?', (user['id'],), one=True)['cnt']
     following_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE follower_id = ?', (user['id'],), one=True)['cnt']
 
-    #  NEW: CHECK FOLLOW STATUS 
-    is_currently_following = False # Default to False
+    is_currently_following = False
     current_user_id = session.get('user_id')
     
     # We only need to check if a user is logged in
@@ -333,7 +492,7 @@ def user_followers(username):
         FROM follows f
         JOIN users u ON f.follower_id = u.id
         WHERE f.followed_id = ?
-    ''', (user['id'],))
+    ''', (user['id'],)) or []
     return render_template('user_list.html.j2', user=user, users=followers, title="Followers of")
 
 @app.route('/u/<username>/following')
@@ -346,7 +505,7 @@ def user_following(username):
         FROM follows f
         JOIN users u ON f.followed_id = u.id
         WHERE f.follower_id = ?
-    ''', (user['id'],))
+    ''', (user['id'],)) or []
     return render_template('user_list.html.j2', user=user, users=following, title="Users followed by")
 
 @app.route('/posts/<int:post_id>')
@@ -377,16 +536,14 @@ def post_detail(post_id):
         FROM reactions
         WHERE post_id = ?
         GROUP BY reaction_type
-    ''', (post_id,))
+    ''', (post_id,)) or []
 
     #  Fetch and Moderate Comments 
-    comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post_id,))
+    comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post_id,)) or []
     
-    comments = [] # Create a new list for the moderated comments
+    comments = []
     for comment_raw in comments_raw:
-        comment = dict(comment_raw) # Convert to a dictionary
-        # Moderate the content of each comment
-        print(comment['content'])
+        comment = dict(comment_raw)
         moderated_comment_content, _ = moderate_content(comment['content'])
         comment['content'] = moderated_comment_content
         comments.append(comment)
@@ -431,14 +588,13 @@ def signup():
             # 1. Get the ID of the user we just created.
             new_user_id = cur.lastrowid
 
-            # 2. Add user info to the session cookie.
-            session.clear() # Clear any old session data
+            session.clear()
             session['user_id'] = new_user_id
             session['username'] = username
 
             # 3. Flash a welcome message and redirect to the feed.
             flash(f'Welcome, {username}! Your account has been created.', 'success')
-            return redirect(url_for('feed')) # Redirect to the main feed/dashboard
+            return redirect(url_for('feed'))
 
         except sqlite3.IntegrityError:
             flash('Username already taken. Please choose another one.', 'danger')
@@ -478,6 +634,28 @@ def logout():
     session.clear()
     flash('Logged out.', 'info')
     return redirect(url_for('login'))
+
+@app.route('/groups/<int:group_id>/join', methods=['POST'])
+def join_group(group_id):
+    user_id = session.get('user_id')
+    if not user_id:
+        flash("You must be logged in to join a subgroup.", "danger")
+        return redirect(url_for('login'))
+    
+    query_db('INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?, ?)', (group_id, user_id))
+    flash('Joined subgroup successfully!', 'success')
+    return redirect(request.referrer or url_for('feed'))
+
+@app.route('/groups/<int:group_id>/leave', methods=['POST'])
+def leave_group(group_id):
+    user_id = session.get('user_id')
+    if not user_id:
+        flash("You must be logged in to leave a subgroup.", "danger")
+        return redirect(url_for('login'))
+    
+    query_db('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', (group_id, user_id))
+    flash('Left subgroup.', 'info')
+    return redirect(request.referrer or url_for('feed'))
 
 @app.route('/posts/<int:post_id>/comment', methods=['POST'])
 def add_comment(post_id):
@@ -702,13 +880,13 @@ def admin_dashboard():
         posts_page = 1
         comments_page = 1
     
-    current_tab = request.args.get('tab', 'users') # Default to 'users' tab
+    current_tab = request.args.get('tab', 'users')
 
     users_offset = (users_page - 1) * PAGE_SIZE
     
     # First, get all users to calculate risk, then apply pagination in Python
     # It's more complex to do this efficiently in SQL if risk calc is Python-side
-    all_users_raw = query_db('SELECT id, username, profile, created_at FROM users')
+    all_users_raw = query_db('SELECT id, username, profile, created_at FROM users') or []
     all_users = []
     for user in all_users_raw:
         user_dict = dict(user)
@@ -726,15 +904,16 @@ def admin_dashboard():
 
     # --- Posts Tab Data ---
     posts_offset = (posts_page - 1) * PAGE_SIZE
-    total_posts_count = query_db('SELECT COUNT(*) as count FROM posts', one=True)['count']
+    total_posts_row = query_db('SELECT COUNT(*) as count FROM posts', one=True)
+    total_posts_count = total_posts_row['count'] if total_posts_row else 0
     total_posts_pages = (total_posts_count + PAGE_SIZE - 1) // PAGE_SIZE
 
     posts_raw = query_db(f'''
         SELECT p.id, p.content, p.created_at, u.username, u.created_at as user_created_at
         FROM posts p JOIN users u ON p.user_id = u.id
-        ORDER BY p.id DESC -- Order by ID for consistent pagination before risk sort
+        ORDER BY p.id DESC
         LIMIT ? OFFSET ?
-    ''', (PAGE_SIZE, posts_offset))
+    ''', (PAGE_SIZE, posts_offset)) or []
     posts = []
     for post in posts_raw:
         post_dict = dict(post)
@@ -750,19 +929,20 @@ def admin_dashboard():
         post_dict['risk_score'] = round(final_score, 2)
         posts.append(post_dict)
 
-    posts.sort(key=lambda x: x['risk_score'], reverse=True) # Sort after fetching and scoring
+    posts.sort(key=lambda x: x['risk_score'], reverse=True)
 
     # --- Comments Tab Data ---
     comments_offset = (comments_page - 1) * PAGE_SIZE
-    total_comments_count = query_db('SELECT COUNT(*) as count FROM comments', one=True)['count']
+    total_comments_row = query_db('SELECT COUNT(*) as count FROM comments', one=True)
+    total_comments_count = total_comments_row['count'] if total_comments_row else 0
     total_comments_pages = (total_comments_count + PAGE_SIZE - 1) // PAGE_SIZE
 
     comments_raw = query_db(f'''
         SELECT c.id, c.content, c.created_at, u.username, u.created_at as user_created_at
         FROM comments c JOIN users u ON c.user_id = u.id
-        ORDER BY c.id DESC -- Order by ID for consistent pagination before risk sort
+        ORDER BY c.id DESC
         LIMIT ? OFFSET ?
-    ''', (PAGE_SIZE, comments_offset))
+    ''', (PAGE_SIZE, comments_offset)) or []
     comments = []
     for comment in comments_raw:
         comment_dict = dict(comment)
@@ -777,8 +957,7 @@ def admin_dashboard():
         comment_dict['risk_score'] = round(score, 2)
         comments.append(comment_dict)
 
-    comments.sort(key=lambda x: x['risk_score'], reverse=True) # Sort after fetching and scoring
-
+    comments.sort(key=lambda x: x['risk_score'], reverse=True)
 
     return render_template('admin.html.j2', 
                            users=users, 
@@ -885,10 +1064,8 @@ def user_risk_analysis(user_id):
     """
     
     score = 0
+    return score
 
-    return score;
-
-    
 # Assignment 2.1
 def moderate_content(content):
     """
@@ -915,29 +1092,8 @@ def moderate_content(content):
 # Coding Assignment #3
 # Assignment 3.1
 def recommend(user_id, filter_following):
-    """
-    Args:
-        user_id: The ID of the current user.
-        filter_following: Boolean, True if we only want to see recommendations from followed users.
-
-    Returns:
-        A list of 5 recommended posts, in reverse-chronological order.
-
-    To test whether your recommendation algorithm works, let's pretend we like the DIY topic. Here are some users that often post DIY comment and a few example posts. Make sure your account did not engage with anything else. You should test your algorithm with these and see if your recommendation algorithm picks up on your interest in DIY and starts showing related content.
-    
-    Users: @starboy99, @DancingDolphin, @blogger_bob
-    Posts: 1810, 1875, 1880, 2113
-    
-    Materials: 
-    - https://www.nvidia.com/en-us/glossary/recommendation-system/
-    - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
-    - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
-    """
-
-    recommended_posts = {} 
-
-    return recommended_posts;
+    recommended_posts = []
+    return recommended_posts
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
-

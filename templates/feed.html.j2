@@ -8,6 +8,50 @@
 
 {% if session.get('user_id') %}
 <div class="col-md-8 mx-auto mb-4">
+
+  <!-- Design Claim 13: Contribution Goal & Benchmark Challenge -->
+  {% if activity %}
+  <div class="card shadow-sm mb-4 border-primary">
+    <div class="card-body">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h5 class="card-title text-primary mb-0 font-weight-bold">
+          🎯 Contribution Challenge
+        </h5>
+        <span class="badge bg-primary">
+          Target: {{ activity.suggested_target }} Posts
+        </span>
+      </div>
+      <p class="card-text mb-2">
+        You have published <strong>{{ activity.user_posts }}</strong> post{% if activity.user_posts != 1 %}s{% endif %}.
+        The community average is <strong>{{ activity.avg_posts }}</strong> posts.
+      </p>
+      
+      {% set progress = ((activity.user_posts / activity.suggested_target) * 100) if activity.suggested_target > 0 else 0 %}
+      <div class="progress mb-2" style="height: 18px;">
+        <div 
+          class="progress-bar bg-success progress-bar-striped progress-bar-animated" 
+          role="progressbar" 
+          style="width: {{ progress|round }}%;" 
+          aria-valuenow="{{ activity.user_posts }}" 
+          aria-valuemin="0" 
+          aria-valuemax="{{ activity.suggested_target }}">
+          {{ progress|round }}%
+        </div>
+      </div>
+      
+      <small class="text-muted">
+        {% set remaining = activity.suggested_target - activity.user_posts %}
+        {% if remaining > 0 %}
+          Publish <strong>{{ remaining }}</strong> more post{% if remaining != 1 %}s{% endif %} to reach your system-suggested target!
+        {% else %}
+          🎉 Target achieved! You are significantly contributing above the average!
+        {% endif %}
+      </small>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Create Post Form (With Subgroup Selector) -->
   <div class="card shadow-sm">
     <div class="card-body">
       <h5 class="card-title">Create a new post</h5>
@@ -15,10 +59,88 @@
         <div class="mb-3">
           <textarea class="form-control" name="content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" required></textarea>
         </div>
-        <button type="submit" class="btn btn-primary float-end">Post</button>
+        <div class="d-flex justify-content-between align-items-center">
+          {% if all_groups %}
+          <div class="col-md-5">
+            <select name="group_id" class="form-select form-select-sm">
+              <option value="">Posting to General Feed</option>
+              {% for group in all_groups | default([]) %}
+                <option value="{{ group.id }}">{{ group.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          {% else %}
+          <div></div>
+          {% endif %}
+          <button type="submit" class="btn btn-primary float-end">Post</button>
+        </div>
       </form>
     </div>
   </div>
+
+  <!-- Design Claim 1: Needed Contributions Widget -->
+  {% if needed_contributions %}
+  <div class="card shadow-sm mt-4 border-warning">
+    <div class="card-body">
+      <h6 class="card-title text-warning font-weight-bold mb-3">
+        🤝 Help the Community
+      </h6>
+      <p class="card-text small mb-3">
+        These recent posts from people you follow don't have any comments yet. Be the first to start the conversation!
+      </p>
+      <ul class="list-group list-group-flush">
+        {% for task in needed_contributions | default([]) %}
+        <li class="list-group-item d-flex justify-content-between align-items-center px-0 py-2 border-0">
+          <span>Post by <strong>{{ user_display(task.username) }}</strong></span>
+          <a href="/posts/{{ task.id }}" class="btn btn-sm btn-outline-warning">
+            View & Comment
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Design Claim 2: Named Subgroups Widget -->
+  {% if all_groups %}
+  <div class="card shadow-sm mt-4 border-info">
+    <div class="card-body">
+      <h6 class="card-title text-info font-weight-bold mb-3">
+        🏷️ Community Subgroups
+      </h6>
+      <div class="list-group list-group-flush">
+        {% for group in all_groups | default([]) %}
+        <div class="list-group-item d-flex justify-content-between align-items-center px-0 py-2 border-0">
+          <div>
+            <strong class="d-block">
+              <a href="#" class="text-decoration-none text-dark" onclick="return false;">
+                {{ group.name }}
+              </a>
+            </strong>
+            <small class="text-muted d-block">{{ group.description }}</small>
+            <span class="badge bg-secondary mt-1">{{ group.member_count }} member{% if group.member_count != 1 %}s{% endif %}</span>
+          </div>
+          <div>
+            {% if session.get('user_id') %}
+              {% if group.is_member %}
+                <form action="{{ url_for('leave_group', group_id=group.id) }}" method="POST" class="d-inline">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">Leave</button>
+                </form>
+              {% else %}
+                <form action="{{ url_for('join_group', group_id=group.id) }}" method="POST" class="d-inline">
+                  <button type="submit" class="btn btn-sm btn-outline-primary">Join</button>
+                </form>
+              {% endif %}
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
 </div>
 {% endif %}
 
@@ -26,47 +148,48 @@
 
 <div class="mb-4 text-center">
 
-<!-- This is the 'sort' filter for New / Popular / Recommended -->
-  <div class="btn-group me-5" role="group" aria-label="Sort posts">
-    <!-- The link preserves the current_show state -->
+  <!-- Sort Filter -->
+  <div class="btn-group me-3 mb-2" role="group" aria-label="Sort posts">
     <a href="{{ url_for('feed', sort='new', show=current_show) }}" class="btn {% if current_sort == 'new' %}btn-primary{% else %}btn-light{% endif %}">New</a>
     <a href="{{ url_for('feed', sort='popular', show=current_show) }}" class="btn {% if current_sort == 'popular' %}btn-primary{% else %}btn-light{% endif %}">Popular</a>
     <a href="{{ url_for('feed', sort='recommended', show=current_show) }}" class="btn {% if current_sort == 'recommended' %}btn-primary{% else %}btn-light{% endif %}">Recommended</a>
   </div>
 
-  <!-- This is the 'show' filter for All / Following -->
-  <!-- Following is only shown to logged in users -->
+  <!-- Show Filter (Including My Subgroups) -->
   {% if session.get('user_id') %}
-  <div class="btn-group" role="group" aria-label="Filter posts">
-    <!-- The link preserves the current_sort state -->
+  <div class="btn-group mb-2" role="group" aria-label="Filter posts">
     <a href="{{ url_for('feed', sort=current_sort, show='all') }}" class="btn {% if current_show == 'all' %}btn-primary{% else %}btn-light{% endif %}">All</a>
     <a href="{{ url_for('feed', sort=current_sort, show='following') }}" class="btn {% if current_show == 'following' %}btn-primary{% else %}btn-light{% endif %}">Following</a>
+    <a href="{{ url_for('feed', sort=current_sort, show='my_groups') }}" class="btn {% if current_show == 'my_groups' %}btn-primary{% else %}btn-light{% endif %}">My Subgroups</a>
   </div>
-   {% endif %}
+  {% endif %}
 
-  
 </div>
 
 <div class="col-md-8 mx-auto">
-  {% for entry in posts %}
+  {% for entry in posts | default([]) %}
   <div class="card mb-4" id="post-{{ entry.post.id }}">
     <div class="card-body">
       <div class="d-flex justify-content-between align-items-center">
         <h3 class="card-title mb-0">
           {% if entry.followed_poster %}
-          <a href="/u/{{ entry.post.user_id }}">{{ user_display(entry.post.username) }}<span class="text-success p-1" data-toggle="tooltip" data-placement="top" title="You are following this user"> ✓ </span>
-</a>
+          <a href="/u/{{ entry.post.user_id }}">{{ user_display(entry.post.username) }}<span class="text-success p-1" data-toggle="tooltip" data-placement="top" title="You are following this user"> ✓ </span></a>
           {% else %}
-          <a href="/u/{{ entry.post.user_id }}">{{ user_display(entry.post.username) }} </a>
+          <a href="/u/{{ entry.post.user_id }}">{{ user_display(entry.post.username) }}</a>
+          {% endif %}
+
+          {% if entry.post.group_name %}
+          <span class="badge bg-info text-white fs-6 ms-2">
+            {{ entry.post.group_name }}
+          </span>
           {% endif %}
         </h3>
 
-        
         {% if session.get('user_id') == entry.post.user_id %}
         <div class="d-flex align-items-center">
             <small class="text-muted me-3">{{ entry.post.created_at|datetimeformat }}</small>
             <form action="{{ url_for('delete_post', post_id=entry.post.id) }}" method="POST" onsubmit="return confirm('Are you sure you want to delete this post?');">
-                <button type="submit" class="btn btn-danger" title="Delete Post">
+                <button type="submit" class="btn btn-danger btn-sm" title="Delete Post">
                    delete
                 </button>
             </form>
@@ -80,10 +203,9 @@
 
       <!-- Reactions Display and Add Reaction Button -->
       <div class="d-flex align-items-center mt-2 mb-2">
-        <!-- Display existing reactions -->
         <div class="reactions-display me-2">
             {% if entry.reactions %}
-              {% for react in entry.reactions %}
+              {% for react in entry.reactions | default([]) %}
                 {% if react.reaction_type == entry.user_reaction %}
                   <form action="{{ url_for('unreact') }}" method="post" class="d-inline">
                     <input type="hidden" name="post_id" value="{{ entry.post.id }}">
@@ -92,7 +214,7 @@
                     </button>
                   </form>
                 {% else %}
-                  <span class=" text-dark me-1" title="{{ react.reaction_type|capitalize }}">
+                  <span class="text-dark me-1" title="{{ react.reaction_type|capitalize }}">
                     {{ reaction_emojis.get(react.reaction_type, '👍') }} {{ react.count }}
                   </span>
                 {% endif %}
@@ -102,14 +224,13 @@
             {% endif %}
         </div>
 
-        <!-- Add Reaction Dropdown Button -->
         {% if session.get('user_id') %}
         <div class="dropdown">
-          <button class="btn btn-sm btn-light text-dark rounded-circle m-0" type="button" id="dropdownMenuButton-{{ entry.post.id }}" data-bs-toggle="dropdown" aria-expanded="false" title="Add Reaction" >
+          <button class="btn btn-sm btn-light text-dark rounded-circle m-0" type="button" id="dropdownMenuButton-{{ entry.post.id }}" data-bs-toggle="dropdown" aria-expanded="false" title="Add Reaction">
             +
           </button>
           <ul class="dropdown-menu" aria-labelledby="dropdownMenuButton-{{ entry.post.id }}">
-            {% for reaction_type in reaction_types %}
+            {% for reaction_type in reaction_types | default([]) %}
             <li>
               <form action="{{ url_for('add_reaction') }}" method="POST" class="d-inline">
                 <input type="hidden" name="post_id" value="{{ entry.post.id }}">
@@ -125,16 +246,11 @@
         {% endif %}
       </div>
 
-
      {% if entry.comments %}
       <hr>
-      {% if entry.comments %}
-        <h6 class="mb-0">Comments ({{ entry.comments | count }})</h4>
-      {% else %}
-        <h6 class="mb-0">Comments</h4>
-      {% endif %}
+      <h6 class="mb-0">Comments ({{ entry.comments | count }})</h6>
       <ul class="list-group list-group-flush shadow-none border-0">
-        {% for comment in entry.comments[-2:] %}
+        {% for comment in (entry.comments | default([]))[-2:] %}
         <li class="card shadow-none p-2 mt-2">
           <div class="d-flex justify-content-between">
             <div>
@@ -163,7 +279,6 @@
     </div>
   </div>
   
-
   <div class="modal fade" id="addCommentModal-{{ entry.post.id }}" tabindex="-1" aria-labelledby="addCommentModalLabel-{{ entry.post.id }}" aria-hidden="true">
     <div class="modal-dialog">
       <div class="modal-content">
