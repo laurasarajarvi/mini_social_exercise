@@ -59,19 +59,14 @@ def query_db(query, args=(), one=False, commit=False):
     """
     db = get_db()
     
-    # Using 'with' on a connection object implicitly handles transactions.
-    # The 'with' statement will automatically commit if successful, 
-    # or rollback if an exception occurs. This is safer.
     try:
         with db:
             cur = db.execute(query, args)
         
-        # For SELECT statements, fetch the results after the transaction block
         if not commit:
             rv = cur.fetchall()
             return (rv[0] if rv else None) if one else rv
         
-        # For write operations, we might want the cursor to get info like lastrowid
         return cur
 
     except sqlite3.Error as e:
@@ -153,6 +148,11 @@ def init_groups():
         for name, desc in default_groups:
             query_db('INSERT INTO groups (name, description) VALUES (?, ?)', (name, desc))
 
+    # =========================================================
+    # Design Claim 2: Seed Quarantine Subgroup (Group 999)
+    # =========================================================
+    query_db("INSERT OR IGNORE INTO groups (id, name, description) VALUES (999, '⚠️ Quarantine / Under Review', 'Posts with flagged content redirected for moderation review.')")
+
 
 @app.route('/')
 def feed():
@@ -166,6 +166,9 @@ def feed():
         page = 1
     sort = request.args.get('sort', 'new').lower()
     show = request.args.get('show', 'all').lower()
+
+    # Subgroup filter parameter
+    selected_group_id = request.args.get('group_id', type=int)
     
     # Define how many posts to show per page
     POSTS_PER_PAGE = 10
@@ -174,16 +177,23 @@ def feed():
     current_user_id = session.get('user_id')
     params = []
 
-    #  2. Build the Query with Subgroup Filtering Support
-    where_clause = ""
-    if show == 'following' and current_user_id:
-        where_clause = "WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
-        params.append(current_user_id)
-    elif show == 'my_groups' and current_user_id:
-        where_clause = "WHERE p.group_id IN (SELECT group_id FROM group_members WHERE user_id = ?)"
-        params.append(current_user_id)
+    #  2. Build Query with Subgroup Filtering & Quarantine Exclusion (Design Claim 2)
+    if selected_group_id:
+        where_clause = "WHERE p.group_id = ?"
+        params.append(selected_group_id)
+    else:
+        # Exclude Quarantine posts (group_id = 999) unless explicitly viewing Group 999
+        where_conditions = ["(p.group_id != 999 OR p.group_id IS NULL)"]
 
-    # Add the pagination parameters to the query arguments
+        if show == 'following' and current_user_id:
+            where_conditions.append("p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)")
+            params.append(current_user_id)
+        elif show == 'my_groups' and current_user_id:
+            where_conditions.append("p.group_id IN (SELECT group_id FROM group_members WHERE user_id = ?)")
+            params.append(current_user_id)
+
+        where_clause = "WHERE " + " AND ".join(where_conditions)
+
     pagination_params = (POSTS_PER_PAGE, offset)
 
     if sort == 'popular':
@@ -221,7 +231,6 @@ def feed():
 
     posts_data = []
     for post in posts:
-        # Determine if the current user follows the poster
         followed_poster = False
         if current_user_id and post['user_id'] != current_user_id:
             follow_check = query_db(
@@ -232,7 +241,6 @@ def feed():
             if follow_check:
                 followed_poster = True
 
-        # Determine if the current user reacted to this post and with what reaction
         user_reaction = None
         if current_user_id:
             reaction_check = query_db(
@@ -262,7 +270,6 @@ def feed():
 
     activity = get_user_activity(current_user_id) if current_user_id else None
 
-    # Needed Contributions Widget
     needed_contributions = []
     if current_user_id:
         needed_contributions = query_db('''
@@ -276,7 +283,6 @@ def feed():
             LIMIT 3
         ''', (current_user_id,)) or []
 
-    # Named Subgroups Data
     if current_user_id:
         all_groups = query_db('''
             SELECT g.id, g.name, g.description,
@@ -313,27 +319,36 @@ def add_post():
     """Handles creating a new post from the feed or a subgroup."""
     user_id = session.get('user_id')
 
-    # Block access if user is not logged in
     if not user_id:
         flash('You must be logged in to create a post.', 'danger')
         return redirect(url_for('login'))
 
-    # Get content from the submitted form
     content = request.form.get('content')
-    group_id = request.form.get('group_id') or None
+    group_id_raw = request.form.get('group_id')
+    group_id = int(group_id_raw) if group_id_raw and group_id_raw.isdigit() else None
 
-    # Pass the user's content through the moderation function
-    moderated_content = content
+    # Prevent manual selection of group 999
+    if group_id == 999:
+        group_id = None
 
-    # Basic validation to ensure post is not empty
-    if moderated_content and moderated_content.strip():
+    # Run moderation check to determine risk score and group redirection
+    moderated_content, score = moderate_content(content)
+
+    # Design Claim 2: Redirect high-risk posts (score >= 5.0) to Quarantine
+    QUARANTINE_GROUP_ID = 999
+    if score >= 5.0:
+        group_id = QUARANTINE_GROUP_ID
+        flash('Notice: Your post contained flagged content and was redirected to the Quarantine section for review.', 'warning')
+
+    if content and content.strip():
         db = get_db()
+        # Save the original RAW 'content' so moderation can evaluate it on read/analysis
         db.execute('INSERT INTO posts (user_id, content, group_id) VALUES (?, ?, ?)',
-                   (user_id, moderated_content, group_id))
+                   (user_id, content, group_id))
         db.commit()
-        flash('Your post was successfully created!', 'success')
+        if score < 5.0:
+            flash('Your post was successfully created!', 'success')
     else:
-        # This will catch empty posts or posts that were fully censored
         flash('Post cannot be empty or was fully censored.', 'warning')
 
     return redirect(request.referrer or url_for('feed'))
@@ -397,41 +412,32 @@ def delete_post(post_id):
     """Handles deleting a post."""
     user_id = session.get('user_id')
 
-    # Block access if user is not logged in
     if not user_id:
         flash('You must be logged in to delete a post.', 'danger')
         return redirect(url_for('login'))
 
-    # Find the post in the database
     post = query_db('SELECT id, user_id FROM posts WHERE id = ?', (post_id,), one=True)
 
-    # Check if the post exists and if the current user is the owner
     if not post:
         flash('Post not found.', 'danger')
         return redirect(url_for('feed'))
 
     if post['user_id'] != user_id:
-        # Security check: prevent users from deleting others' posts
         flash('You do not have permission to delete this post.', 'danger')
         return redirect(url_for('feed'))
 
-    # If all checks pass, proceed with deletion
     db = get_db()
-    # To maintain database integrity, delete associated records first
     db.execute('DELETE FROM comments WHERE post_id = ?', (post_id,))
     db.execute('DELETE FROM reactions WHERE post_id = ?', (post_id,))
-    # Finally, delete the post itself
     db.execute('DELETE FROM posts WHERE id = ?', (post_id,))
     db.commit()
 
     flash('Your post was successfully deleted.', 'success')
-    # Redirect back to the page the user came from, or the feed as a fallback
     return redirect(request.referrer or url_for('feed'))
 
 @app.route('/u/<username>')
 def user_profile(username):
     """Displays a user's profile page with moderated bio, posts, and latest comments."""
-    
     user_raw = query_db('SELECT * FROM users WHERE username = ?', (username,), one=True)
     if not user_raw:
         abort(404)
@@ -462,7 +468,6 @@ def user_profile(username):
     is_currently_following = False
     current_user_id = session.get('user_id')
     
-    # We only need to check if a user is logged in
     if current_user_id:
         follow_relation = query_db(
             'SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?',
@@ -471,7 +476,6 @@ def user_profile(username):
         )
         if follow_relation:
             is_currently_following = True
-    # --
 
     return render_template('user_profile.html.j2', 
                            user=user, 
@@ -480,7 +484,6 @@ def user_profile(username):
                            followers_count=followers_count, 
                            following_count=following_count,
                            is_following=is_currently_following)
-    
 
 @app.route('/u/<username>/followers')
 def user_followers(username):
@@ -511,26 +514,25 @@ def user_following(username):
 @app.route('/posts/<int:post_id>')
 def post_detail(post_id):
     """Displays a single post and its comments, with content moderation applied."""
-    
     post_raw = query_db('''
-        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        SELECT p.id, p.content, p.group_id, p.created_at, u.username, u.id as user_id
         FROM posts p
         JOIN users u ON p.user_id = u.id
         WHERE p.id = ?
     ''', (post_id,), one=True)
 
     if not post_raw:
-        # The abort function will stop the request and show a 404 Not Found page.
         abort(404)
 
-    #  Moderation for the Main Post 
-    # Convert the raw database row to a mutable dictionary
+    # Design Claim 2 Safeguard: Block viewing quarantined posts in detail view
+    if post_raw['group_id'] == 999:
+        flash('This post is under quarantine review and cannot be viewed in detail.', 'warning')
+        return redirect(url_for('feed'))
+
     post = dict(post_raw)
-    # Unpack the tuple from moderate_content, we only need the moderated content string here
     moderated_post_content, _ = moderate_content(post['content'])
     post['content'] = moderated_post_content
 
-    #  Fetch Reactions (No moderation needed) 
     reactions = query_db('''
         SELECT reaction_type, COUNT(*) as count
         FROM reactions
@@ -538,7 +540,6 @@ def post_detail(post_id):
         GROUP BY reaction_type
     ''', (post_id,)) or []
 
-    #  Fetch and Moderate Comments 
     comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post_id,)) or []
     
     comments = []
@@ -548,7 +549,6 @@ def post_detail(post_id):
         comment['content'] = moderated_comment_content
         comments.append(comment)
 
-    # Pass the moderated data to the template
     return render_template('post_detail.html.j2',
                            post=post,
                            reactions=reactions,
@@ -563,7 +563,6 @@ def about():
 @app.route('/privacy')
 def privacy():
     return render_template('privacy.html.j2')
-
 
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
@@ -585,14 +584,12 @@ def signup():
             )
             db.commit()
 
-            # 1. Get the ID of the user we just created.
             new_user_id = cur.lastrowid
 
             session.clear()
             session['user_id'] = new_user_id
             session['username'] = username
 
-            # 3. Flash a welcome message and redirect to the feed.
             flash(f'Welcome, {username}! Your account has been created.', 'success')
             return redirect(url_for('feed'))
 
@@ -614,17 +611,12 @@ def login():
         user = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
         db.close()
 
-        # 1. Check if the user exists.
-        # 2. If user exists, use check_password_hash to securely compare the password.
-        #    This function handles the salt and prevents timing attacks.
         if user and check_password_hash(user['password'], password):
-            # Password is correct!
             session['user_id'] = user['id']
             session['username'] = user['username']
             flash('Logged in successfully.', 'success')
             return redirect(url_for('feed'))
         else:
-            # User does not exist or password was incorrect.
             flash('Invalid username or password.', 'danger')
             
     return render_template('login.html.j2')
@@ -637,6 +629,11 @@ def logout():
 
 @app.route('/groups/<int:group_id>/join', methods=['POST'])
 def join_group(group_id):
+    # Design Claim 2 Safeguard: Block users from manually joining automated Quarantine
+    if group_id == 999:
+        flash("You cannot join the automated Quarantine subgroup.", "warning")
+        return redirect(url_for('feed'))
+    
     user_id = session.get('user_id')
     if not user_id:
         flash("You must be logged in to join a subgroup.", "danger")
@@ -648,6 +645,11 @@ def join_group(group_id):
 
 @app.route('/groups/<int:group_id>/leave', methods=['POST'])
 def leave_group(group_id):
+    # Design Claim 2 Safeguard: Block users from leaving automated Quarantine
+    if group_id == 999:
+        flash("You cannot leave the automated Quarantine subgroup.", "warning")
+        return redirect(url_for('feed'))
+    
     user_id = session.get('user_id')
     if not user_id:
         flash("You must be logged in to leave a subgroup.", "danger")
@@ -662,15 +664,12 @@ def add_comment(post_id):
     """Handles adding a new comment to a specific post."""
     user_id = session.get('user_id')
 
-    # Block access if user is not logged in
     if not user_id:
         flash('You must be logged in to comment.', 'danger')
         return redirect(url_for('login'))
 
-    # Get content from the submitted form
     content = request.form.get('content')
 
-    # Basic validation to ensure comment is not empty
     if content and content.strip():
         db = get_db()
         db.execute('INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)',
@@ -680,7 +679,6 @@ def add_comment(post_id):
     else:
         flash('Comment cannot be empty.', 'warning')
 
-    # Redirect back to the page the user came from (likely the post detail page)
     return redirect(request.referrer or url_for('post_detail', post_id=post_id))
 
 @app.route('/comments/<int:comment_id>/delete', methods=['POST'])
@@ -688,12 +686,10 @@ def delete_comment(comment_id):
     """Handles deleting a comment."""
     user_id = session.get('user_id')
 
-    # Block access if user is not logged in
     if not user_id:
         flash('You must be logged in to delete a comment.', 'danger')
         return redirect(url_for('login'))
 
-    # Find the comment and the original post's author ID
     comment = query_db('''
         SELECT c.id, c.user_id, p.user_id as post_author_id
         FROM comments c
@@ -701,23 +697,19 @@ def delete_comment(comment_id):
         WHERE c.id = ?
     ''', (comment_id,), one=True)
 
-    # Check if the comment exists
     if not comment:
         flash('Comment not found.', 'danger')
         return redirect(request.referrer or url_for('feed'))
 
-    # Security Check: Allow deletion if the user is the comment's author OR the post's author
     if user_id != comment['user_id'] and user_id != comment['post_author_id']:
         flash('You do not have permission to delete this comment.', 'danger')
         return redirect(request.referrer or url_for('feed'))
 
-    # If all checks pass, proceed with deletion
     db = get_db()
     db.execute('DELETE FROM comments WHERE id = ?', (comment_id,))
     db.commit()
 
     flash('Comment successfully deleted.', 'success')
-    # Redirect back to the page the user came from
     return redirect(request.referrer or url_for('feed'))
 
 @app.route('/react', methods=['POST'])
@@ -738,16 +730,13 @@ def add_reaction():
 
     db = get_db()
 
-    # Step 1: Check if a reaction from this user already exists on this post.
     existing_reaction = query_db('SELECT id FROM reactions WHERE post_id = ? AND user_id = ?',
                                  (post_id, user_id), one=True)
 
     if existing_reaction:
-        # Step 2: If it exists, UPDATE the reaction_type.
         db.execute('UPDATE reactions SET reaction_type = ? WHERE id = ?',
                    (new_reaction_type, existing_reaction['id']))
     else:
-        # Step 3: If it does not exist, INSERT a new reaction.
         db.execute('INSERT INTO reactions (post_id, user_id, reaction_type) VALUES (?, ?, ?)',
                    (post_id, user_id, new_reaction_type))
 
@@ -772,7 +761,6 @@ def unreact():
 
     db = get_db()
 
-    # Remove the reaction if it exists
     existing_reaction = query_db(
         'SELECT id FROM reactions WHERE post_id = ? AND user_id = ?',
         (post_id, user_id),
@@ -788,23 +776,19 @@ def unreact():
 
     return redirect(request.referrer or url_for('feed'))
 
-
 @app.route('/u/<int:user_id>/follow', methods=['POST'])
 def follow_user(user_id):
     """Handles the logic for the current user to follow another user."""
     follower_id = session.get('user_id')
 
-    # Security: Ensure user is logged in
     if not follower_id:
         flash("You must be logged in to follow users.", "danger")
         return redirect(url_for('login'))
 
-    # Security: Prevent users from following themselves
     if follower_id == user_id:
         flash("You cannot follow yourself.", "warning")
         return redirect(request.referrer or url_for('feed'))
 
-    # Check if the user to be followed actually exists
     user_to_follow = query_db('SELECT id FROM users WHERE id = ?', (user_id,), one=True)
     if not user_to_follow:
         flash("The user you are trying to follow does not exist.", "danger")
@@ -812,7 +796,6 @@ def follow_user(user_id):
         
     db = get_db()
     try:
-        # Insert the follow relationship. The PRIMARY KEY constraint will prevent duplicates if you've set one.
         db.execute('INSERT INTO follows (follower_id, followed_id) VALUES (?, ?)',
                    (follower_id, user_id))
         db.commit()
@@ -823,13 +806,11 @@ def follow_user(user_id):
 
     return redirect(request.referrer or url_for('feed'))
 
-
 @app.route('/u/<int:user_id>/unfollow', methods=['POST'])
 def unfollow_user(user_id):
     """Handles the logic for the current user to unfollow another user."""
     follower_id = session.get('user_id')
 
-    # Security: Ensure user is logged in
     if not follower_id:
         flash("You must be logged in to unfollow users.", "danger")
         return redirect(url_for('login'))
@@ -840,14 +821,11 @@ def unfollow_user(user_id):
     db.commit()
 
     if cur.rowcount > 0:
-        # cur.rowcount tells us if a row was actually deleted
         username_unfollowed = query_db('SELECT username FROM users WHERE id = ?', (user_id,), one=True)['username']
         flash(f"You have unfollowed {username_unfollowed}.", "success")
     else:
-        # This case handles if someone tries to unfollow a user they weren't following
         flash("You were not following this user.", "info")
 
-    # Redirect back to the page the user came from
     return redirect(request.referrer or url_for('feed'))
 
 @app.route('/admin')
@@ -870,7 +848,6 @@ def admin_dashboard():
             return "LOW", 1
         return "NONE", 0
 
-    # Get pagination and current tab parameters
     try:
         users_page = int(request.args.get('users_page', 1))
         posts_page = int(request.args.get('posts_page', 1))
@@ -881,11 +858,8 @@ def admin_dashboard():
         comments_page = 1
     
     current_tab = request.args.get('tab', 'users')
-
     users_offset = (users_page - 1) * PAGE_SIZE
     
-    # First, get all users to calculate risk, then apply pagination in Python
-    # It's more complex to do this efficiently in SQL if risk calc is Python-side
     all_users_raw = query_db('SELECT id, username, profile, created_at FROM users') or []
     all_users = []
     for user in all_users_raw:
@@ -902,7 +876,6 @@ def admin_dashboard():
     users = all_users[users_offset : users_offset + PAGE_SIZE]
     total_users_pages = (total_users + PAGE_SIZE - 1) // PAGE_SIZE
 
-    # --- Posts Tab Data ---
     posts_offset = (posts_page - 1) * PAGE_SIZE
     total_posts_row = query_db('SELECT COUNT(*) as count FROM posts', one=True)
     total_posts_count = total_posts_row['count'] if total_posts_row else 0
@@ -931,7 +904,6 @@ def admin_dashboard():
 
     posts.sort(key=lambda x: x['risk_score'], reverse=True)
 
-    # --- Comments Tab Data ---
     comments_offset = (comments_page - 1) * PAGE_SIZE
     total_comments_row = query_db('SELECT COUNT(*) as count FROM comments', one=True)
     total_comments_count = total_comments_row['count'] if total_comments_row else 0
@@ -963,29 +935,20 @@ def admin_dashboard():
                            users=users, 
                            posts=posts, 
                            comments=comments,
-                           
-                           # Pagination for Users
                            users_page=users_page,
                            total_users_pages=total_users_pages,
                            users_has_next=(users_page < total_users_pages),
                            users_has_prev=(users_page > 1),
-
-                           # Pagination for Posts
                            posts_page=posts_page,
                            total_posts_pages=total_posts_pages,
                            posts_has_next=(posts_page < total_posts_pages),
                            posts_has_prev=(posts_page > 1),
-
-                           # Pagination for Comments
                            comments_page=comments_page,
                            total_comments_pages=total_comments_pages,
                            comments_has_next=(comments_page < total_comments_pages),
                            comments_has_prev=(comments_page > 1),
-
                            current_tab=current_tab,
                            PAGE_SIZE=PAGE_SIZE)
-
-
 
 @app.route('/admin/delete/user/<int:user_id>', methods=['POST'])
 def admin_delete_user(user_id):
@@ -1003,7 +966,6 @@ def admin_delete_user(user_id):
     flash(f'User {user_id} and all their content has been deleted.', 'success')
     return redirect(url_for('admin_dashboard'))
 
-
 @app.route('/admin/delete/post/<int:post_id>', methods=['POST'])
 def admin_delete_post(post_id):
     if session.get('username') != 'admin':
@@ -1017,7 +979,6 @@ def admin_delete_post(post_id):
     db.commit()
     flash(f'Post {post_id} has been deleted.', 'success')
     return redirect(url_for('admin_dashboard'))
-
 
 @app.route('/admin/delete/comment/<int:comment_id>', methods=['POST'])
 def admin_delete_comment(comment_id):
@@ -1037,7 +998,6 @@ def rules():
 
 @app.template_global()
 def loop_color(user_id):
-    # Generate a pastel color based on user_id hash
     h = hashlib.md5(str(user_id).encode()).hexdigest()
     r = int(h[0:2], 16)
     g = int(h[2:4], 16)
@@ -1045,52 +1005,115 @@ def loop_color(user_id):
     return f'rgb({r % 128 + 80}, {g % 128 + 80}, {b % 128 + 80})'
 
 
-# ----- Functions to be implemented are below
-# Coding Assignment #2
+# ----- Coding Assignment #2 Implementations -----
 
-# Assignment 2.2
+# Assignment 2.2: User Risk Analysis
 def user_risk_analysis(user_id):
     """
-    Args:
-        user_id: The ID of the user on which we perform risk analysis.
-
-    Returns:
-        A float number score showing the risk associated with this user. There are no strict rules or bounds to this score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk. (An upper bound of 5.0 is applied to this score elsewhere in the codebase) 
-        
-        You will be able to check the scores by logging in with the administrator account:
-            username: admin
-            password: admin
-        Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
+    Evaluates aggregate user risk level based on user history, violation scores,
+    and account age multipliers.
     """
-    
-    score = 0
-    return score
+    user = query_db('SELECT id, profile, created_at FROM users WHERE id = ?', (user_id,), one=True)
+    if not user:
+        return 0.0
 
-# Assignment 2.1
+    # Step 1: Profile Score
+    profile_text = user['profile'] or ''
+    _, profile_score = moderate_content(profile_text)
+
+    # Step 2: Average Post Score
+    posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,)) or []
+    if posts:
+        post_scores = [moderate_content(p['content'])[1] for p in posts]
+        average_post_score = sum(post_scores) / len(post_scores)
+    else:
+        average_post_score = 0.0
+
+    # Step 3: Average Comment Score
+    comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,)) or []
+    if comments:
+        comment_scores = [moderate_content(c['content'])[1] for c in comments]
+        average_comment_score = sum(comment_scores) / len(comment_scores)
+    else:
+        average_comment_score = 0.0
+
+    # Step 4: Combine Scores
+    content_risk_score = (profile_score * 1.0) + (average_post_score * 3.0) + (average_comment_score * 1.0)
+
+    # Step 5: Apply Age Multiplier
+    created_at = user['created_at']
+    if isinstance(created_at, str):
+        try:
+            created_at = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            created_at = datetime.strptime(created_at.split('.')[0], '%Y-%m-%d %H:%M:%S')
+
+    account_age_days = (datetime.utcnow() - created_at).days
+
+    if account_age_days < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif account_age_days < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+
+    # Step 6: Final Capping (Upper bound 5.0)
+    return min(5.0, user_risk_score)
+
+# Assignment 2.1: Content Moderation & Censorship
 def moderate_content(content):
     """
-    Args
-        content: the text content of a post or comment to be moderated.
-        
-    Returns: 
-        A tuple containing the moderated content (string) and a severity score (float). There are no strict rules or bounds to the severity score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk.
-    
-    This function moderates a string of content and calculates a severity score based on
-    rules loaded from the 'censorship.dat' file. These are already loaded as TIER1_WORDS, TIER2_PHRASES and TIER3_WORDS. Tier 1 corresponds to strong profanity, Tier 2 to scam/spam phrases and Tier 3 to mild profanity.
-    
-    You will be able to check the scores by logging in with the administrator account:
-            username: admin
-            password: admin
-    Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
+    Moderates text content against loaded censorship rules and calculates severity scores.
+    Design Claim 1: Prescreens, degrades mild profanity, and removes severe violations.
     """
+    if not content:
+        return "", 0.0
 
+    # Stage 1.1: Severe Violation Checks
+    for word in TIER1_WORDS:
+        pattern = rf'\b{re.escape(word)}\b'
+        if re.search(pattern, content, flags=re.IGNORECASE):
+            return "[content removed due to severe violation]", 5.0
+
+    for phrase in TIER2_PHRASES:
+        pattern = rf'\b{re.escape(phrase)}\b'
+        if re.search(pattern, content, flags=re.IGNORECASE):
+            return "[content removed due to spam/scam policy]", 5.0
+
+    # Stage 1.2: Scored Violations & Filtering
     moderated_content = content
-    score = 0
+    score = 0.0
+
+    # Rule 1.2.1 (Tier 3 Words): Mask with asterisks, +2.0 per match
+    for word in TIER3_WORDS:
+        pattern = rf'\b{re.escape(word)}\b'
+        matches = re.findall(pattern, moderated_content, flags=re.IGNORECASE)
+        if matches:
+            score += 2.0 * len(matches)
+            moderated_content = re.sub(
+                pattern, 
+                lambda m: '*' * len(m.group(0)), 
+                moderated_content, 
+                flags=re.IGNORECASE
+            )
+
+    # Rule 1.2.2 (External Links): Replace URL with placeholder, +2.0 per match
+    url_pattern = r'https?://\S+|www\.\S+'
+    urls = re.findall(url_pattern, moderated_content)
+    if urls:
+        score += 2.0 * len(urls)
+        moderated_content = re.sub(url_pattern, '[link removed]', moderated_content)
+
+    # Rule 1.2.3 (Excessive Capitalization): >15 chars & >70% uppercase -> +0.5 score
+    alpha_chars = [c for c in content if c.isalpha()]
+    if len(alpha_chars) > 15:
+        upper_chars = [c for c in alpha_chars if c.isupper()]
+        if (len(upper_chars) / len(alpha_chars)) > 0.70:
+            score += 0.5
     
     return moderated_content, score
 
-# Coding Assignment #3
-# Assignment 3.1
+# Assignment 3.1 Stub
 def recommend(user_id, filter_following):
     recommended_posts = []
     return recommended_posts

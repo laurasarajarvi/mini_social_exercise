@@ -65,7 +65,10 @@
             <select name="group_id" class="form-select form-select-sm">
               <option value="">Posting to General Feed</option>
               {% for group in all_groups | default([]) %}
+                <!-- Design Claim 2 Safeguard: Prevent users from manually publishing into Quarantine -->
+                {% if group.id != 999 %}
                 <option value="{{ group.id }}">{{ group.name }}</option>
+                {% endif %}
               {% endfor %}
             </select>
           </div>
@@ -114,15 +117,20 @@
         <div class="list-group-item d-flex justify-content-between align-items-center px-0 py-2 border-0">
           <div>
             <strong class="d-block">
-              <a href="#" class="text-decoration-none text-dark" onclick="return false;">
+              <!-- Link subgroup name directly to its group view -->
+              <a href="{{ url_for('feed', group_id=group.id) }}" class="text-decoration-none text-dark font-weight-bold">
                 {{ group.name }}
               </a>
             </strong>
             <small class="text-muted d-block">{{ group.description }}</small>
-            <span class="badge bg-secondary mt-1">{{ group.member_count }} member{% if group.member_count != 1 %}s{% endif %}</span>
+            <!-- Design Claim 2 Safeguard: Hide member count badge for Quarantine subgroup -->
+            {% if group.id != 999 %}
+              <span class="badge bg-secondary mt-1">{{ group.member_count }} member{% if group.member_count != 1 %}s{% endif %}</span>
+            {% endif %}
           </div>
           <div>
-            {% if session.get('user_id') %}
+            <!-- Design Claim 2 Safeguard: Hide Join/Leave buttons for Quarantine subgroup -->
+            {% if session.get('user_id') and group.id != 999 %}
               {% if group.is_member %}
                 <form action="{{ url_for('leave_group', group_id=group.id) }}" method="POST" class="d-inline">
                   <button type="submit" class="btn btn-sm btn-outline-danger">Leave</button>
@@ -178,7 +186,11 @@
           <a href="/u/{{ entry.post.user_id }}">{{ user_display(entry.post.username) }}</a>
           {% endif %}
 
-          {% if entry.post.group_name %}
+          {% if entry.post.group_id == 999 %}
+          <span class="badge bg-warning text-dark fs-6 ms-2">
+            ⚠️ Quarantined
+          </span>
+          {% elif entry.post.group_name %}
           <span class="badge bg-info text-white fs-6 ms-2">
             {{ entry.post.group_name }}
           </span>
@@ -224,7 +236,8 @@
             {% endif %}
         </div>
 
-        {% if session.get('user_id') %}
+        <!-- Design Claim 2 Safeguard: Disable adding reactions to quarantined posts -->
+        {% if session.get('user_id') and entry.post.group_id != 999 %}
         <div class="dropdown">
           <button class="btn btn-sm btn-light text-dark rounded-circle m-0" type="button" id="dropdownMenuButton-{{ entry.post.id }}" data-bs-toggle="dropdown" aria-expanded="false" title="Add Reaction">
             +
@@ -271,12 +284,19 @@
       {% endif %}
 
       <div class="d-flex justify-content-between mt-3">
-        <a href="/posts/{{ entry.post.id }}" class="btn btn-sm btn-light show-comments-btn">
-          Show all comments
-        </a>
-        <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addCommentModal-{{ entry.post.id }}">Add Comment</button>
+        <!-- Design Claim 2 Safeguard: Restrict single-post view & comment modal on quarantined posts -->
+        {% if entry.post.group_id != 999 %}
+          <a href="/posts/{{ entry.post.id }}" class="btn btn-sm btn-light show-comments-btn">
+            Show all comments
+          </a>
+          <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addCommentModal-{{ entry.post.id }}">Add Comment</button>
+        {% else %}
+          <span class="badge bg-secondary d-flex align-items-center p-2">
+            🔒 Comments & Details Restricted (Quarantined)
+          </span>
+        {% endif %}
       </div>
-    </div>
+    </div>  
   </div>
   
   <div class="modal fade" id="addCommentModal-{{ entry.post.id }}" tabindex="-1" aria-labelledby="addCommentModalLabel-{{ entry.post.id }}" aria-hidden="true">
